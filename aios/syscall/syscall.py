@@ -1,3 +1,4 @@
+import logging
 import time
 import json
 from typing import Dict, List, Any, Optional
@@ -27,6 +28,8 @@ from cerebrum.llm.apis import LLMQuery, LLMResponse
 from cerebrum.memory.apis import MemoryQuery, MemoryResponse
 from cerebrum.storage.apis import StorageQuery, StorageResponse
 from cerebrum.tool.apis import ToolQuery, ToolResponse
+
+logger = logging.getLogger(__name__)
 
 class SyscallExecutor:
     """
@@ -666,7 +669,15 @@ class SyscallExecutor:
             if query.action_type in ("chat", "chat_with_tool_call_output"):
                 # Context injection (before LLM call)
                 if self.context_injector:
-                    query = self.context_injector.inject(agent_name, query)
+                    query, injection_diag = (
+                        self.context_injector.inject(
+                            agent_name, query
+                        )
+                    )
+                    logger.debug(
+                        "Injection diagnostics: %s",
+                        injection_diag,
+                    )
 
                 llm_response = self.execute_llm_syscall(agent_name, query)
 

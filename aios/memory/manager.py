@@ -176,9 +176,11 @@ class MemoryManager:
             return self.provider.get_memory(query.params["memory_id"])
         
         elif operation_type == "retrieve_memory":
+            query.params["agent_name"] = memory_syscall.agent_name
             return self.provider.retrieve_memory(query)
         
         elif operation_type == "retrieve_memory_raw":
+            query.params["agent_name"] = memory_syscall.agent_name
             return self.provider.retrieve_memory_raw(query)
         
         else:

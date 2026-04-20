@@ -55,25 +55,66 @@ class ContextInjector:
         self,
         agent_name: str,
         query: LLMQuery,
-    ) -> LLMQuery:
+    ) -> "tuple[LLMQuery, dict]":
         """Retrieve relevant memories and prepend as a system
-        message.
+        message, returning diagnostics alongside the query.
 
-        Returns the query unmodified when:
-        - ``auto_inject`` is disabled
-        - no user-role messages exist in the query
-        - no memories survive filtering
-        - any exception occurs during retrieval or formatting
+        After retrieving the agent's own memories, the injector
+        derives a ``user_id`` from the metadata of those memories
+        and issues a second retrieval for shared memories from
+        other agents with the same ``user_id``.  The two result
+        sets are merged and deduplicated before relevance
+        filtering and token-budget truncation.
+
+        Returns ``(query, diagnostics)`` in all code paths:
+
+        - **disabled**: ``auto_inject_enabled=False``, counts
+          at 0, empty lists, tokens unchanged.
+        - **happy path**: fully populated diagnostics.
+        - **exception**: ``injected_count`` forced to 0,
+          partially-filled diagnostics.
         """
         if not self.enabled:
-            return query
+            tokens = self._estimate_tokens(
+                self._serialize_messages(query.messages)
+            )
+            return (query, {
+                "auto_inject_enabled": False,
+                "candidate_count": 0,
+                "injected_count": 0,
+                "source_agents": [],
+                "memory_types": [],
+                "prompt_tokens_before": tokens,
+                "prompt_tokens_after": tokens,
+            })
+
+        diagnostics: dict = {
+            "auto_inject_enabled": True,
+            "candidate_count": 0,
+            "injected_count": 0,
+            "source_agents": [],
+            "memory_types": [],
+            "prompt_tokens_before": 0,
+            "prompt_tokens_after": 0,
+        }
 
         try:
+            diagnostics["prompt_tokens_before"] = (
+                self._estimate_tokens(
+                    self._serialize_messages(
+                        query.messages
+                    )
+                )
+            )
+
             user_text = self._extract_latest_user_message(
                 query.messages
             )
             if user_text is None:
-                return query
+                diagnostics["prompt_tokens_after"] = (
+                    diagnostics["prompt_tokens_before"]
+                )
+                return (query, diagnostics)
 
             # Retrieve memories scoped to this agent
             mem_query = MemoryQuery(
@@ -98,21 +139,51 @@ class ContextInjector:
                     "No memories retrieved for user_id=%s",
                     agent_name,
                 )
-                return query
+                diagnostics["prompt_tokens_after"] = (
+                    diagnostics["prompt_tokens_before"]
+                )
+                return (query, diagnostics)
 
-            results = response.search_results
+            own_results = response.search_results
             logger.info(
-                "Retrieved %d memories for user_id=%s",
-                len(results),
+                "Retrieved %d own memories for agent=%s",
+                len(own_results),
                 agent_name,
             )
+
+            # --- Cross-agent shared memory retrieval ---
+            derived_user_id = (
+                self._extract_user_id_from_results(
+                    own_results
+                )
+            )
+
+            results = list(own_results)
+
+            if derived_user_id:
+                shared = self._retrieve_shared_memories(
+                    user_text, derived_user_id
+                )
+                if shared:
+                    results = self._merge_and_deduplicate(
+                        own_results, shared
+                    )
+                    logger.info(
+                        "Merged %d shared memories for "
+                        "user_id=%s (total %d)",
+                        len(shared),
+                        derived_user_id,
+                        len(results),
+                    )
+
+            # candidate_count = merged set before filtering
+            diagnostics["candidate_count"] = len(results)
 
             # Filter by relevance threshold
             filtered = []
             for mem in results:
                 score = mem.get("score")
                 if score is None:
-                    # No score from provider — include by default
                     filtered.append(mem)
                 elif score >= self.relevance_threshold:
                     filtered.append(mem)
@@ -131,7 +202,10 @@ class ContextInjector:
                     "threshold for user_id=%s",
                     agent_name,
                 )
-                return query
+                diagnostics["prompt_tokens_after"] = (
+                    diagnostics["prompt_tokens_before"]
+                )
+                return (query, diagnostics)
 
             # Sort by score descending (most relevant first)
             filtered.sort(
@@ -139,14 +213,33 @@ class ContextInjector:
                 reverse=True,
             )
 
-            # Truncate by token budget, removing least
-            # relevant first
+            # Truncate by token budget
             filtered = self._truncate_by_token_budget(
                 filtered
             )
 
             if not filtered:
-                return query
+                diagnostics["prompt_tokens_after"] = (
+                    diagnostics["prompt_tokens_before"]
+                )
+                return (query, diagnostics)
+
+            # Record injected_count after all filtering
+            diagnostics["injected_count"] = len(filtered)
+
+            # Extract unique source_agents and memory_types
+            agents: set = set()
+            types: set = set()
+            for mem in filtered:
+                meta = mem.get("metadata") or {}
+                oa = meta.get("owner_agent", "")
+                if oa:
+                    agents.add(oa)
+                mt = meta.get("memory_type", "")
+                if mt:
+                    types.add(mt)
+            diagnostics["source_agents"] = list(agents)
+            diagnostics["memory_types"] = list(types)
 
             # Build and prepend the system message
             block = self._format_memory_block(filtered)
@@ -156,12 +249,20 @@ class ContextInjector:
             }
             query.messages = [system_msg] + query.messages
 
+            diagnostics["prompt_tokens_after"] = (
+                self._estimate_tokens(
+                    self._serialize_messages(
+                        query.messages
+                    )
+                )
+            )
+
             logger.info(
                 "Injected %d memories for user_id=%s",
                 len(filtered),
                 agent_name,
             )
-            return query
+            return (query, diagnostics)
 
         except Exception:
             logger.warning(
@@ -170,7 +271,94 @@ class ContextInjector:
                 agent_name,
                 exc_info=True,
             )
-            return query
+            diagnostics["injected_count"] = 0
+            # If prompt_tokens_after was never set, match
+            # prompt_tokens_before (query was not modified).
+            if diagnostics["prompt_tokens_after"] == 0:
+                diagnostics["prompt_tokens_after"] = (
+                    diagnostics["prompt_tokens_before"]
+                )
+            return (query, diagnostics)
+
+    # ------------------------------------------------------------------
+    # Cross-agent helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_user_id_from_results(
+        results: list,
+    ) -> Optional[str]:
+        """Return the first non-empty ``user_id`` found in the
+        metadata of *results*, or ``None`` if none exists."""
+        for mem in results:
+            meta = mem.get("metadata") or {}
+            uid = meta.get("user_id")
+            if uid:
+                return uid
+        return None
+
+    def _retrieve_shared_memories(
+        self,
+        user_text: str,
+        user_id: str,
+    ) -> list:
+        """Issue a second retrieval for shared memories from
+        other agents that belong to *user_id*.
+
+        Returns an empty list on any failure so the caller can
+        fall back to using only the agent's own memories.
+        """
+        try:
+            shared_query = MemoryQuery(
+                operation_type="retrieve_memory",
+                params={
+                    "content": user_text,
+                    "k": self.max_memories,
+                    "user_id": user_id,
+                    "sharing_policy": "shared",
+                },
+            )
+            resp = (
+                self.memory_manager.provider
+                .retrieve_memory(shared_query)
+            )
+            if resp.success and resp.search_results:
+                return resp.search_results
+        except Exception:
+            logger.debug(
+                "Shared memory retrieval failed for "
+                "user_id=%s",
+                user_id,
+                exc_info=True,
+            )
+        return []
+
+    @staticmethod
+    def _merge_and_deduplicate(
+        own: list,
+        shared: list,
+    ) -> list:
+        """Merge *own* and *shared* result lists, removing
+        duplicates by memory content.
+
+        Own memories always come first so they are never
+        dropped in favour of a shared duplicate.
+        """
+        seen_content: set = set()
+        merged: list = []
+
+        for mem in own:
+            content = mem.get("content", "")
+            seen_content.add(content)
+            merged.append(mem)
+
+        for mem in shared:
+            content = mem.get("content", "")
+            if content not in seen_content:
+                seen_content.add(content)
+                merged.append(mem)
+
+        return merged
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -208,6 +396,14 @@ class ContextInjector:
         lines.append("")
         lines.append("===== END MEMORY CONTEXT =====")
         return "\n".join(lines)
+
+    @staticmethod
+    def _serialize_messages(messages: list) -> str:
+        """Join all message content strings for token
+        estimation."""
+        return " ".join(
+            m.get("content", "") for m in messages
+        )
 
     @staticmethod
     def _estimate_tokens(text: str) -> int:
