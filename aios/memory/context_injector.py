@@ -116,13 +116,15 @@ class ContextInjector:
                 )
                 return (query, diagnostics)
 
-            # Retrieve memories scoped to this agent
+            # Retrieve memories scoped to this agent.
+            # ``agent_name`` is used for ownership filtering
+            # inside the provider (not as ``user_id``).
             mem_query = MemoryQuery(
                 operation_type="retrieve_memory",
                 params={
                     "content": user_text,
                     "k": self.max_memories,
-                    "user_id": agent_name,
+                    "agent_name": agent_name,
                 },
             )
             response = (
@@ -162,18 +164,27 @@ class ContextInjector:
 
             if derived_user_id:
                 shared = self._retrieve_shared_memories(
-                    user_text, derived_user_id
+                    user_text, derived_user_id, agent_name
                 )
                 if shared:
                     results = self._merge_and_deduplicate(
                         own_results, shared
                     )
+                    shared_agents = list({
+                        (m.get("metadata") or {}).get(
+                            "owner_agent", ""
+                        )
+                        for m in shared
+                        if (m.get("metadata") or {}).get(
+                            "owner_agent", ""
+                        )
+                    })
                     logger.info(
-                        "Merged %d shared memories for "
-                        "user_id=%s (total %d)",
+                        "Retrieved %d shared memories for "
+                        "user_id=%s from agents: %s",
                         len(shared),
                         derived_user_id,
-                        len(results),
+                        shared_agents,
                     )
 
             # candidate_count = merged set before filtering
@@ -258,9 +269,23 @@ class ContextInjector:
             )
 
             logger.info(
-                "Injected %d memories for user_id=%s",
+                "Injected %d memories (%d own + %d shared) "
+                "for agent=%s, user_id=%s",
                 len(filtered),
+                sum(
+                    1 for m in filtered
+                    if (m.get("metadata") or {}).get(
+                        "owner_agent", ""
+                    ) == agent_name
+                ),
+                sum(
+                    1 for m in filtered
+                    if (m.get("metadata") or {}).get(
+                        "owner_agent", ""
+                    ) != agent_name
+                ),
                 agent_name,
+                derived_user_id or agent_name,
             )
             return (query, diagnostics)
 
@@ -301,6 +326,7 @@ class ContextInjector:
         self,
         user_text: str,
         user_id: str,
+        agent_name: str | None = None,
     ) -> list:
         """Issue a second retrieval for shared memories from
         other agents that belong to *user_id*.
@@ -309,14 +335,17 @@ class ContextInjector:
         fall back to using only the agent's own memories.
         """
         try:
+            params: dict = {
+                "content": user_text,
+                "k": self.max_memories,
+                "user_id": user_id,
+                "sharing_policy": "shared",
+            }
+            if agent_name is not None:
+                params["agent_name"] = agent_name
             shared_query = MemoryQuery(
                 operation_type="retrieve_memory",
-                params={
-                    "content": user_text,
-                    "k": self.max_memories,
-                    "user_id": user_id,
-                    "sharing_policy": "shared",
-                },
+                params=params,
             )
             resp = (
                 self.memory_manager.provider
