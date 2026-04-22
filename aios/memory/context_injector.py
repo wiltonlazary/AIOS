@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Optional
 from cerebrum.llm.apis import LLMQuery
 from cerebrum.memory.apis import MemoryQuery
 
+from aios.memory.memory_formatter import format_memory
+
 if TYPE_CHECKING:
     from aios.memory.manager import MemoryManager
 
@@ -283,6 +285,24 @@ class ContextInjector:
                 key=lambda m: m.get("score", 0),
                 reverse=True,
             )
+
+            # Format memory content to natural language
+            formatted_memories = []
+            for mem in filtered:
+                formatted = dict(mem)  # shallow copy
+                try:
+                    formatted["content"] = format_memory(
+                        mem.get("content", ""),
+                        mem.get("metadata", {}),
+                    )
+                except Exception:
+                    logger.warning(
+                        "Memory formatting failed, "
+                        "using raw content",
+                        exc_info=True,
+                    )
+                formatted_memories.append(formatted)
+            filtered = formatted_memories
 
             # Truncate by token budget
             filtered = self._truncate_by_token_budget(
